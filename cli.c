@@ -37,6 +37,8 @@ static struct uci_context *ctx;
 enum {
 	/* section cmds */
 	CMD_GET,
+	CMD_GET_RECORD,
+	CMD_GET_TABLE,
 	CMD_SET,
 	CMD_ADD_LIST,
 	CMD_DEL_LIST,
@@ -53,6 +55,7 @@ enum {
 	CMD_ADD,
 	CMD_IMPORT,
 	CMD_HELP,
+	CMD_BATCH
 };
 
 struct uci_type_list {
@@ -145,6 +148,8 @@ static void uci_usage(void)
 		"\tdel_list   <config>.<section>.<option>=<string>\n"
 		"\tshow       [<config>[.<section>[.<option>]]]\n"
 		"\tget        <config>.<section>[.<option>]\n"
+		"\tget-rec    <config>.<section>\n"
+		"\tget-table  <config> <section-type>\n"
 		"\tset        <config>.<section>[.<option>]=<value>\n"
 		"\tdelete     <config>[.<section>[[.<option>][=<id>]]]\n"
 		"\trename     <config>.<section>[.<option>]=<name>\n"
@@ -202,7 +207,7 @@ static void uci_print_value(FILE *f, const char *v)
 	fprintf(f, "'");
 }
 
-static void uci_show_value(struct uci_option *o, bool quote)
+static void uci_print_option_value(struct uci_option *o, bool quote)
 {
 	struct uci_element *e;
 	bool sep = false;
@@ -214,7 +219,6 @@ static void uci_show_value(struct uci_option *o, bool quote)
 			uci_print_value(stdout, o->v.string);
 		else
 			printf("%s", o->v.string);
-		printf("\n");
 		break;
 	case UCI_TYPE_LIST:
 		uci_foreach_element(&o->v.list, e) {
@@ -226,12 +230,17 @@ static void uci_show_value(struct uci_option *o, bool quote)
 				uci_print_value(stdout, e->name);
 			sep = true;
 		}
-		printf("\n");
 		break;
 	default:
-		printf("<unknown>\n");
+		printf(quote ? "<unknown>" : "'<unknown>'");
 		break;
 	}
+}
+
+static void uci_show_value(struct uci_option *o, bool quote)
+{
+	uci_print_option_value(o, quote);
+	printf("\n");
 }
 
 static void uci_show_option(struct uci_option *o, bool quote)
@@ -464,6 +473,42 @@ done:
 	return ret;
 }
 
+static void uci_print_option(struct uci_option *o, char const *name)
+{
+	printf("%s=", name);
+	uci_print_option_value(o, true);
+}
+
+static void uci_print_section(struct uci_section *s)
+{
+	struct uci_element *e;
+	bool first = true;
+	uci_foreach_element(&s->options, e) {
+		if (!first)
+			printf(";");
+		uci_print_option(uci_to_option(e), e->name);
+		first = false;
+	}
+}
+
+static void uci_print_table(struct uci_package *p, char const *type)
+{
+	struct uci_element *e;
+
+	uci_reset_typelist();
+	uci_foreach_element( &p->sections, e) {
+		struct uci_section *s = uci_to_section(e);
+		cur_section_ref = uci_lookup_section_ref(s);
+		if (!strcmp(s->type, type)) {
+			printf("config='%s';", s->e.name);
+			uci_print_section(s);
+			printf("\n");
+		}
+	}
+	uci_reset_typelist();
+}
+
+
 static int uci_do_section_cmd(int cmd, int argc, char **argv)
 {
 	struct uci_element *e;
@@ -504,6 +549,24 @@ static int uci_do_section_cmd(int cmd, int argc, char **argv)
 		}
 		/* throw the value to stdout */
 		break;
+	case CMD_GET_RECORD:
+		if (!(ptr.flags & UCI_LOOKUP_COMPLETE)) {
+			ctx->err = UCI_ERR_NOTFOUND;
+			cli_perror();
+			return 1;
+		}
+		switch(e->type) {
+		case UCI_TYPE_SECTION:
+			uci_print_section(ptr.s);
+			break;
+		case UCI_TYPE_OPTION:
+			uci_print_option(ptr.o, ptr.option);
+			break;
+		default:
+			break;
+		}
+		printf("\n");
+		break;
 	case CMD_RENAME:
 		ret = uci_rename(ctx, &ptr);
 		break;
@@ -536,6 +599,54 @@ static int uci_do_section_cmd(int cmd, int argc, char **argv)
 
 	/* no save necessary for get */
 	if ((cmd == CMD_GET) || (cmd == CMD_REVERT))
+		return 0;
+
+	/* save changes, but don't commit them yet */
+	if (ret == UCI_OK)
+		ret = uci_save(ctx, ptr.p);
+
+	if (ret != UCI_OK) {
+		cli_perror();
+		return 1;
+	}
+
+	return 0;
+}
+
+static int uci_do_table_cmd(int cmd, int argc, char **argv)
+{
+	struct uci_element *e;
+	struct uci_ptr ptr;
+	int ret = UCI_OK;
+
+	if (argc != 3)
+		return 255;
+
+	if (uci_lookup_ptr(ctx, &ptr, argv[1], true) != UCI_OK) {
+		cli_perror();
+		return 1;
+	}
+
+	e = ptr.last;
+	switch(cmd) {
+	case CMD_GET_TABLE:
+		if (!(ptr.flags & UCI_LOOKUP_COMPLETE)) {
+			ctx->err = UCI_ERR_NOTFOUND;
+			cli_perror();
+			return 1;
+		}
+		switch(e->type) {
+		case UCI_TYPE_PACKAGE:
+			uci_print_table(ptr.p, argv[2]);
+			break;
+		default:
+			break;
+		}
+		break;
+	}
+
+	/* no save necessary for get */
+	if ((cmd == CMD_GET_TABLE))
 		return 0;
 
 	/* save changes, but don't commit them yet */
@@ -616,48 +727,46 @@ static int uci_batch(void)
 	return 0;
 }
 
+typedef struct { char const *sample; int cmd; } t_uci_cmd;
+
 static int uci_cmd(int argc, char **argv)
 {
-	int cmd = 0;
+	int cmd = -1;
 
-	if (!strcasecmp(argv[0], "batch") && !(flags & CLI_FLAG_BATCH))
-		return uci_batch();
-	else if (!strcasecmp(argv[0], "show"))
-		cmd = CMD_SHOW;
-	else if (!strcasecmp(argv[0], "changes"))
-		cmd = CMD_CHANGES;
-	else if (!strcasecmp(argv[0], "export"))
-		cmd = CMD_EXPORT;
-	else if (!strcasecmp(argv[0], "commit"))
-		cmd = CMD_COMMIT;
-	else if (!strcasecmp(argv[0], "get"))
-		cmd = CMD_GET;
-	else if (!strcasecmp(argv[0], "set"))
-		cmd = CMD_SET;
-	else if (!strcasecmp(argv[0], "ren") ||
-	         !strcasecmp(argv[0], "rename"))
-		cmd = CMD_RENAME;
-	else if (!strcasecmp(argv[0], "revert"))
-		cmd = CMD_REVERT;
-	else if (!strcasecmp(argv[0], "reorder"))
-		cmd = CMD_REORDER;
-	else if (!strcasecmp(argv[0], "del") ||
-	         !strcasecmp(argv[0], "delete"))
-		cmd = CMD_DEL;
-	else if (!strcasecmp(argv[0], "import"))
-		cmd = CMD_IMPORT;
-	else if (!strcasecmp(argv[0], "help"))
-		cmd = CMD_HELP;
-	else if (!strcasecmp(argv[0], "add"))
-		cmd = CMD_ADD;
-	else if (!strcasecmp(argv[0], "add_list"))
-		cmd = CMD_ADD_LIST;
-	else if (!strcasecmp(argv[0], "del_list"))
-		cmd = CMD_DEL_LIST;
-	else
-		cmd = -1;
+	static const t_uci_cmd commands[] = {
+		{ "show",      CMD_SHOW },
+		{ "changes",   CMD_CHANGES },
+		{ "export",    CMD_EXPORT },
+		{ "commit",    CMD_COMMIT },
+		{ "get",       CMD_GET },
+		{ "get-rec",   CMD_GET_RECORD },
+		{ "get-table", CMD_GET_TABLE },
+		{ "set",       CMD_SET },
+		{ "ren",       CMD_RENAME },
+		{ "rename",    CMD_RENAME },
+		{ "revert",    CMD_REVERT },
+		{ "reorder",   CMD_REORDER },
+		{ "del",       CMD_DEL },
+		{ "delete",    CMD_DEL },
+		{ "import",    CMD_IMPORT },
+		{ "help",      CMD_HELP },
+		{ "add",       CMD_ADD },
+		{ "add_list",  CMD_ADD_LIST },
+		{ "del_list",  CMD_DEL_LIST },
+		{ "batch",     CMD_BATCH },
+		{ NULL, 0 }
+	};
+
+	for (t_uci_cmd const *p = commands; p->sample; ++p)
+		if (!strcasecmp(argv[0], p->sample)) {
+			cmd = p->cmd;
+			break;
+		}
 
 	switch(cmd) {
+		case CMD_BATCH:
+			return !(flags & CLI_FLAG_BATCH) ? uci_batch() : 255;
+				
 		case CMD_ADD_LIST:
 		case CMD_DEL_LIST:
 		case CMD_GET:
@@ -666,19 +775,28 @@ static int uci_cmd(int argc, char **argv)
 		case CMD_RENAME:
 		case CMD_REVERT:
 		case CMD_REORDER:
+		case CMD_GET_RECORD:
 			return uci_do_section_cmd(cmd, argc, argv);
+
+		case CMD_GET_TABLE:
+			return uci_do_table_cmd(cmd, argc, argv);
+
 		case CMD_SHOW:
 		case CMD_EXPORT:
 		case CMD_COMMIT:
 		case CMD_CHANGES:
 			return uci_do_package_cmd(cmd, argc, argv);
+
 		case CMD_IMPORT:
 			return uci_do_import(argc, argv);
+
 		case CMD_ADD:
 			return uci_do_add(argc, argv);
+
 		case CMD_HELP:
 			uci_usage();
 			return 0;
+
 		default:
 			return 255;
 	}
