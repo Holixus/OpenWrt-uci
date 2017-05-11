@@ -10,6 +10,11 @@ OPTION(UCI_DEBUG_TYPECAST "typecast debugging support" OFF)
 OPTION(BUILD_LUA "build Lua binding" ON)
 OPTION(BUILD_STATIC "statically linking uci" OFF)
 
+
+SET(UCI_CONFDIR "/etc/config" CACHE STRING "Location of config files")
+SET(UCI_SAVEDIR "/tmp/.uci" CACHE STRING "Work files folder")
+
+
 FIND_PATH(ubox_include_dir libubox/usock.h)
 
 CONFIGURE_FILE( ${CMAKE_SOURCE_DIR}/uci_config.h.in ${CMAKE_SOURCE_DIR}/uci_config.h )

@@ -1,2 +1,5 @@
 #cmakedefine UCI_DEBUG 1
 #cmakedefine UCI_DEBUG_TYPECAST 1
+
+#define UCI_CONFDIR "@UCI_CONFDIR@"
+#define UCI_SAVEDIR "@UCI_SAVEDIR@"
